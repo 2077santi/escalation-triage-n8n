@@ -1,0 +1,163 @@
+{
+  "name": "SLA watchdog",
+  "nodes": [
+    {
+      "id": "45262921-233d-50f1-9aa7-92bd57b79518",
+      "name": "Every 15 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "1eea80a2-e88e-597e-ba9b-d28309355558",
+      "name": "Read open tickets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Queue",
+          "mode": "name"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b9f1429a-8c2c-5c86-9c7a-4e5938b7d451",
+      "name": "Check SLA",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Escalation policy: priority matrix, SLA timers, routing and breach detection.\n// This file is embedded verbatim into the n8n Code nodes by build.py, and\n// unit-tested with `node --test`, so the tested logic is the deployed logic.\n\nconst PRIORITY_MATRIX = {\n  // impact -> urgency -> priority (ITIL-style)\n  high: { high: \"P1\", medium: \"P2\", low: \"P3\" },\n  medium: { high: \"P2\", medium: \"P3\", low: \"P3\" },\n  low: { high: \"P3\", medium: \"P4\", low: \"P4\" },\n};\n\n// Minutes to first response, by priority.\nconst SLA_MINUTES = { P1: 15, P2: 60, P3: 240, P4: 1440 };\n\nconst ROUTING = {\n  tooling_outage: { team: \"Tooling & IT\", channel: \"#ops-tooling\" },\n  access_issue: { team: \"IT support\", channel: \"#it-support\" },\n  guideline_question: { team: \"Quality & Policy\", channel: \"#quality-policy\" },\n  data_quality: { team: \"Quality & Policy\", channel: \"#quality-policy\" },\n  capacity_risk: { team: \"Delivery lead\", channel: \"#delivery\" },\n  client_request: { team: \"Project management\", channel: \"#project-mgmt\" },\n  other: { team: \"Ops triage\", channel: \"#ops-triage\" },\n};\n\nconst MIN_CONFIDENCE = 0.6;\nconst AT_RISK_SHARE = 0.75; // warn when 75% of the SLA has elapsed without a response\n\nfunction priorityFor(impact, urgency) {\n  const row = PRIORITY_MATRIX[impact];\n  if (!row || !row[urgency]) throw new Error(`unknown impact/urgency: ${impact}/${urgency}`);\n  return row[urgency];\n}\n\nfunction triage(classification, createdAt) {\n  const { category, impact, urgency, confidence } = classification;\n  const lowConfidence = typeof confidence !== \"number\" || confidence < MIN_CONFIDENCE;\n  let priority = priorityFor(impact, urgency);\n  // A human looks at anything the model is unsure about, and unsure tickets are never left at P4.\n  if (lowConfidence && (priority === \"P4\" || priority === \"P3\")) priority = \"P3\";\n  const route = lowConfidence ? ROUTING.other : (ROUTING[category] || ROUTING.other);\n  const created = new Date(createdAt);\n  const due = new Date(created.getTime() + SLA_MINUTES[priority] * 60000);\n  return {\n    priority,\n    team: route.team,\n    channel: route.channel,\n    sla_minutes: SLA_MINUTES[priority],\n    response_due_at: due.toISOString(),\n    page_on_call: priority === \"P1\",\n    needs_human_review: lowConfidence,\n  };\n}\n\nfunction slaStatus(ticket, now) {\n  const created = new Date(ticket.created_at).getTime();\n  const due = new Date(ticket.response_due_at).getTime();\n  const nowMs = new Date(now).getTime();\n  if (ticket.first_response_at) {\n    return new Date(ticket.first_response_at).getTime() <= due ? \"met\" : \"breached_responded\";\n  }\n  if (nowMs > due) return \"breached\";\n  if ((nowMs - created) / (due - created) >= AT_RISK_SHARE) return \"at_risk\";\n  return \"on_track\";\n}\n\nif (typeof module !== \"undefined\") {\n  module.exports = { PRIORITY_MATRIX, SLA_MINUTES, ROUTING, MIN_CONFIDENCE, priorityFor, triage, slaStatus };\n}\n\n\n// Alert once per status change: on_track -> at_risk -> breached.\nconst now = new Date().toISOString();\nconst alerts = [];\nfor (const item of $input.all()) {\n  const t = item.json;\n  if (!t.ticket_id || t.status === 'closed') continue;\n  const status = slaStatus({ ...t, first_response_at: t.first_response_at || null }, now);\n  if ((status === 'at_risk' || status === 'breached') && t.last_alert !== status) {\n    alerts.push({ json: { ticket_id: t.ticket_id, last_alert: status, priority: t.priority, team: t.team,\n      channel: t.channel, summary: t.summary, response_due_at: t.response_due_at, sla_status: status } });\n  }\n}\nreturn alerts;"
+      }
+    },
+    {
+      "id": "0d5bb414-b4aa-55a4-b286-db71f8d3a6e8",
+      "name": "Mark alerted",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Queue",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "ticket_id"
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "d9fe0f00-254c-5add-9b4c-1b280faae184",
+      "name": "Alert team",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $('Check SLA').item.json.channel }}",
+          "mode": "name"
+        },
+        "text": "={{ $('Check SLA').item.json.sla_status === 'breached' ? ':red_circle: SLA BREACHED' : ':large_orange_circle: SLA at risk' }} - {{ $('Check SLA').item.json.priority }} {{ $('Check SLA').item.json.ticket_id }}: {{ $('Check SLA').item.json.summary }} (due {{ $('Check SLA').item.json.response_due_at }})",
+        "otherOptions": {}
+      }
+    }
+  ],
+  "connections": {
+    "Every 15 minutes": {
+      "main": [
+        [
+          {
+            "node": "Read open tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read open tickets": {
+      "main": [
+        [
+          {
+            "node": "Check SLA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check SLA": {
+      "main": [
+        [
+          {
+            "node": "Mark alerted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark alerted": {
+      "main": [
+        [
+          {
+            "node": "Alert team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}
