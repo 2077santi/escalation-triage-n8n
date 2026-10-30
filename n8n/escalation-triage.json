@@ -1,0 +1,290 @@
+{
+  "name": "Escalation triage (Claude + SLA policy)",
+  "nodes": [
+    {
+      "id": "b4ba0a78-8fad-5d8e-b066-e0ef08ecbbc4",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "escalation",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "cc234580-462a-5943-9863-52cf3515d984",
+      "name": "Prepare request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Build the Claude request for this ticket.\nconst CLASSIFIER = {\"model\": \"claude-opus-5-5\", \"instructions\": \"You triage escalations in an AI training-data operation (annotation, LLM evaluation, data collection). Annotators, team leads and project managers raise issues through a form. Classify the issue so it reaches the right team with the right urgency. Judge only from the text; do not invent details.\\n\\nCATEGORY:\\n- tooling_outage: the labeling tool, platform or a required system is down, erroring or unusably slow\\n- access_issue: one person or a few people cannot log in or lack permissions\\n- guideline_question: unclear or conflicting labeling guideline, edge case with no rule\\n- data_quality: bad or corrupted source data, wrong batch content, systematic labeling errors found in QA\\n- capacity_risk: staffing, absence or throughput problem that threatens a deadline\\n- client_request: a client asks for a change, report, extra volume or a deadline move\\n- other: anything else\\n\\nIMPACT (how much work is affected):\\n- high: a whole team, site, workstream or client delivery\\n- medium: several people or one batch\\n- low: one person or a single item\\n\\nURGENCY (how soon it hurts delivery):\\n- high: work is blocked now or a deadline within 24 hours is at risk\\n- medium: affects this week's delivery\\n- low: no near-term deadline impact\\n\\nCONFIDENCE (0-1): below 0.6 if the text is too vague to classify reliably.\", \"schema\": {\"type\": \"object\", \"properties\": {\"category\": {\"type\": \"string\", \"enum\": [\"tooling_outage\", \"access_issue\", \"guideline_question\", \"data_quality\", \"capacity_risk\", \"client_request\", \"other\"]}, \"impact\": {\"type\": \"string\", \"enum\": [\"high\", \"medium\", \"low\"]}, \"urgency\": {\"type\": \"string\", \"enum\": [\"high\", \"medium\", \"low\"]}, \"summary\": {\"type\": \"string\", \"description\": \"One line, under 15 words, for the queue view.\"}, \"confidence\": {\"type\": \"number\"}, \"reasoning\": {\"type\": \"string\", \"description\": \"One sentence explaining impact and urgency.\"}}, \"required\": [\"category\", \"impact\", \"urgency\", \"summary\", \"confidence\", \"reasoning\"], \"additionalProperties\": false}};\nconst body = $input.first().json.body ?? $input.first().json;\nconst ticket = {\n  ticket_id: 'ESC-' + Date.now().toString(36).toUpperCase(),\n  created_at: new Date().toISOString(),\n  reporter: String(body.reporter ?? 'unknown').slice(0, 200),\n  text: String(body.text ?? '').slice(0, 4000),\n};\nconst request = {\n  model: CLASSIFIER.model,\n  max_tokens: 2000,\n  fallbacks: 'default',\n  output_config: { format: { type: 'json_schema', schema: CLASSIFIER.schema } },\n  messages: [{ role: 'user', content: CLASSIFIER.instructions + '\\n\\n<reporter>' + ticket.reporter + '</reporter>\\n<issue>\\n' + ticket.text + '\\n</issue>' }],\n};\nreturn [{ json: { ticket, request } }];"
+      }
+    },
+    {
+      "id": "23960166-86cf-558b-9d5a-710643301ffe",
+      "name": "Classify with Claude",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "anthropic-beta",
+              "value": "server-side-fallback-2026-07-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "670b8fe8-4040-511e-aad6-83bd59878dd3",
+      "name": "Apply policy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Escalation policy: priority matrix, SLA timers, routing and breach detection.\n// This file is embedded verbatim into the n8n Code nodes by build.py, and\n// unit-tested with `node --test`, so the tested logic is the deployed logic.\n\nconst PRIORITY_MATRIX = {\n  // impact -> urgency -> priority (ITIL-style)\n  high: { high: \"P1\", medium: \"P2\", low: \"P3\" },\n  medium: { high: \"P2\", medium: \"P3\", low: \"P3\" },\n  low: { high: \"P3\", medium: \"P4\", low: \"P4\" },\n};\n\n// Minutes to first response, by priority.\nconst SLA_MINUTES = { P1: 15, P2: 60, P3: 240, P4: 1440 };\n\nconst ROUTING = {\n  tooling_outage: { team: \"Tooling & IT\", channel: \"#ops-tooling\" },\n  access_issue: { team: \"IT support\", channel: \"#it-support\" },\n  guideline_question: { team: \"Quality & Policy\", channel: \"#quality-policy\" },\n  data_quality: { team: \"Quality & Policy\", channel: \"#quality-policy\" },\n  capacity_risk: { team: \"Delivery lead\", channel: \"#delivery\" },\n  client_request: { team: \"Project management\", channel: \"#project-mgmt\" },\n  other: { team: \"Ops triage\", channel: \"#ops-triage\" },\n};\n\nconst MIN_CONFIDENCE = 0.6;\nconst AT_RISK_SHARE = 0.75; // warn when 75% of the SLA has elapsed without a response\n\nfunction priorityFor(impact, urgency) {\n  const row = PRIORITY_MATRIX[impact];\n  if (!row || !row[urgency]) throw new Error(`unknown impact/urgency: ${impact}/${urgency}`);\n  return row[urgency];\n}\n\nfunction triage(classification, createdAt) {\n  const { category, impact, urgency, confidence } = classification;\n  const lowConfidence = typeof confidence !== \"number\" || confidence < MIN_CONFIDENCE;\n  let priority = priorityFor(impact, urgency);\n  // A human looks at anything the model is unsure about, and unsure tickets are never left at P4.\n  if (lowConfidence && (priority === \"P4\" || priority === \"P3\")) priority = \"P3\";\n  const route = lowConfidence ? ROUTING.other : (ROUTING[category] || ROUTING.other);\n  const created = new Date(createdAt);\n  const due = new Date(created.getTime() + SLA_MINUTES[priority] * 60000);\n  return {\n    priority,\n    team: route.team,\n    channel: route.channel,\n    sla_minutes: SLA_MINUTES[priority],\n    response_due_at: due.toISOString(),\n    page_on_call: priority === \"P1\",\n    needs_human_review: lowConfidence,\n  };\n}\n\nfunction slaStatus(ticket, now) {\n  const created = new Date(ticket.created_at).getTime();\n  const due = new Date(ticket.response_due_at).getTime();\n  const nowMs = new Date(now).getTime();\n  if (ticket.first_response_at) {\n    return new Date(ticket.first_response_at).getTime() <= due ? \"met\" : \"breached_responded\";\n  }\n  if (nowMs > due) return \"breached\";\n  if ((nowMs - created) / (due - created) >= AT_RISK_SHARE) return \"at_risk\";\n  return \"on_track\";\n}\n\nif (typeof module !== \"undefined\") {\n  module.exports = { PRIORITY_MATRIX, SLA_MINUTES, ROUTING, MIN_CONFIDENCE, priorityFor, triage, slaStatus };\n}\n\n\n// Parse Claude's structured output; if anything is off, fail safe to human triage.\nconst ticket = $('Prepare request').first().json.ticket;\nconst response = $input.first().json;\nlet classification;\ntry {\n  if (response.stop_reason === 'refusal') throw new Error('refused');\n  const text = (response.content || []).find(b => b.type === 'text').text;\n  classification = JSON.parse(text);\n} catch (e) {\n  classification = { category: 'other', impact: 'medium', urgency: 'medium', confidence: 0,\n    summary: ticket.text.slice(0, 80), reasoning: 'Classifier unavailable (' + e.message + '); sent to human triage.' };\n}\nconst decision = triage(classification, ticket.created_at);\nreturn [{ json: { ...ticket, ...classification, ...decision, status: 'open', first_response_at: '', last_alert: '' } }];"
+      }
+    },
+    {
+      "id": "b08e7b83-40bb-5a37-b760-246884248a5c",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        120
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ticket_id: $json.ticket_id, priority: $json.priority, team: $json.team, response_due_at: $json.response_due_at } }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "5b92eea3-0eda-5754-bb82-5bf349ce20fd",
+      "name": "Log to queue",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Queue",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {}
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "9eba63b2-02f3-561a-991a-8627dacfc87f",
+      "name": "Notify team",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $json.channel }}",
+          "mode": "name"
+        },
+        "text": "=*{{ $json.priority }}* {{ $json.summary }}\n{{ $json.reasoning }}\nTicket {{ $json.ticket_id }} - respond by {{ $json.response_due_at }}{{ $json.needs_human_review ? '\\n:warning: low classifier confidence - please re-triage' : '' }}",
+        "otherOptions": {}
+      }
+    },
+    {
+      "id": "c75df0b3-2bd6-5863-abbe-48d0e18683a6",
+      "name": "P1?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "p1",
+              "leftValue": "={{ $json.page_on_call }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "2eb5de8d-702c-5541-887b-bac2a6499463",
+      "name": "Page on-call",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1540,
+        220
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#ops-oncall",
+          "mode": "name"
+        },
+        "text": "=<!here> P1 escalation for {{ $json.team }}: {{ $json.summary }}\nTicket {{ $json.ticket_id }} - first response due in 15 min.",
+        "otherOptions": {}
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Prepare request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare request": {
+      "main": [
+        [
+          {
+            "node": "Classify with Claude",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify with Claude": {
+      "main": [
+        [
+          {
+            "node": "Apply policy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply policy": {
+      "main": [
+        [
+          {
+            "node": "Log to queue",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to queue": {
+      "main": [
+        [
+          {
+            "node": "Notify team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify team": {
+      "main": [
+        [
+          {
+            "node": "P1?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "P1?": {
+      "main": [
+        [
+          {
+            "node": "Page on-call",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}
