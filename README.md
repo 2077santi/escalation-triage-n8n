@@ -1,12 +1,10 @@
 # Escalation Triage Automation (n8n + Claude)
 
-**Every escalation in an AI data operation gets classified, prioritized, routed and put on an SLA timer in seconds, instead of waiting in a shared inbox for someone to read it.**
+Every escalation in an AI data operation gets classified, prioritized, routed and put on an SLA timer in seconds, instead of waiting in a shared inbox for someone to read it.
 
 An n8n automation for the intake-and-escalation flow of an annotation / LLM-evaluation program. Claude classifies the issue, a tested policy assigns priority and SLA, the right team is notified, P1s page on-call, and a watchdog warns before an SLA is breached.
 
 [Spec](SPEC.md) · [Runbook](docs/RUNBOOK.md) · [Workflows](n8n/) · [Golden set](samples/tickets.jsonl)
-
----
 
 ## The problem
 
@@ -40,9 +38,9 @@ flowchart LR
 ### Guardrails
 
 - **Fail safe:** if Claude is down, times out or refuses, the ticket still gets logged and goes to human triage. It is never dropped.
-- **Low confidence → human:** below 0.6 confidence the ticket goes to the triage channel flagged for review, and is never left at P4.
+- **Low confidence goes to a human:** below 0.6 confidence the ticket goes to the triage channel flagged for review, and is never left at P4.
 - **Untrusted input:** ticket text is wrapped in tags and truncated before it reaches the model; it can't change the routing rules, which live outside the prompt.
-- **No alert spam:** the watchdog alerts once per status change (at risk → breached), tracked in the sheet.
+- **No alert spam:** the watchdog alerts once per status change (at risk to breached), tracked in the sheet.
 - **Refusal fallback:** requests use the API's server-side fallback, so a safety-classifier decline is retried on a fallback model.
 
 ## Tested before deployment
@@ -52,7 +50,7 @@ flowchart LR
 | Priority matrix, SLA timers, routing, breach detection | `node --test` on `policy.js` | 8 tests |
 | **The exported n8n workflows themselves** | Code nodes are extracted from the JSON and run with mocked n8n inputs | 4 tests |
 | Workflow wiring | `build.py` checks every connection points to a real node | on every build |
-| Classifier quality | 24 hand-labeled tickets → accuracy per field, under-prioritized tickets, missed P1s | `make eval` |
+| Classifier quality | 24 hand-labeled tickets: accuracy per field, under-prioritized tickets, missed P1s | `make eval` |
 
 The workflows are **generated** from `policy.js` and `classifier.json` by [`build.py`](workflow/build.py), so the logic in n8n is byte-for-byte the logic the tests check.
 
